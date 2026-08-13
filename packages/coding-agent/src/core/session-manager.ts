@@ -8,7 +8,7 @@ import type {
 	ToolResultMessage,
 	Usage,
 } from "@earendil-works/pi-ai";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import {
 	appendFileSync,
 	chmodSync,
@@ -1579,6 +1579,159 @@ export class SessionManager {
 		return closed.length;
 	}
 
+	/**
+	 * Capture a narrow exact-recovery snapshot from the current active branch.
+	 *
+	 * The snapshot is branch-derived only: the supplied `activeSessionId` and
+	 * `operationId` are accepted for the journal binding contract but are not
+	 * recorded in the returned shape. The session-manager exposes no
+	 * journal-specific types; the journal layer composes its own record by
+	 * adding `operationId`, `activeSessionId`, `sessionFile`, and journal
+	 * bookkeeping fields to this snapshot.
+	 */
+	captureExactRecoveryAuthority(_activeSessionId: string, _operationId: string): ExactRecoverySnapshot {
+		const header = this.getHeader();
+		const sessionId = header?.id ?? this.sessionId;
+		const branch = this.getBranch();
+		// headEntryId is the current leaf; the active branch (root to leaf) is the
+		// authority's lineage prefix, so we hash the full branch.
+		const headEntryId = this.leafId;
+		let assistantEntryId: string | null = null;
+		let toolCalls: ExactRecoveryToolCall[] = [];
+		for (let i = branch.length - 1; i >= 0; i--) {
+			const entry = branch[i];
+			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+			assistantEntryId = entry.id;
+			toolCalls = collectUnresolvedToolCalls(entry.message, branch.slice(i + 1));
+			break;
+		}
+		const lineageDigest = computeLineageDigest(branch);
+		return { sessionId, headEntryId, assistantEntryId, toolCalls, lineageDigest };
+	}
+
+	/**
+	 * Apply exact-authority recovery.
+	 *
+	 * Validates the supplied authority against the current session and either
+	 * appends synthetic error tool results for the journaled tool call ids or
+	 * returns stale/already-applied without writing. The synthetic results
+	 * carry `operationId` and `assistantEntryId` metadata so a retry can resume
+	 * an operation-owned partial suffix.
+	 *
+	 * The `stopReason` of the authorized assistant entry is intentionally
+	 * ignored: when exact tool calls are journaled, the metadata is
+	 * authoritative.
+	 */
+	closeUnresolvedToolCallsWithAuthority(authority: ExactRecoveryAuthority): ExactRecoveryStatus {
+		const header = this.getHeader();
+		const currentSessionId = header?.id ?? this.sessionId;
+		if (authority.sessionId !== currentSessionId) {
+			return { status: "stale", reason: "generation" };
+		}
+		const currentSessionFile = this.getSessionFile();
+		if (!currentSessionFile || authority.sessionFile !== currentSessionFile) {
+			return { status: "stale", reason: "sessionFile" };
+		}
+		const branch = this.getBranch();
+		const prefix = this._prefixThrough(authority.headEntryId, branch);
+		if (prefix === null) {
+			// The head recorded by the journal is not on the active branch.
+			return { status: "stale", reason: "head" };
+		}
+		if (computeLineageDigest(prefix) !== authority.lineageDigest) {
+			return { status: "stale", reason: "lineage" };
+		}
+		let assistantIndex = -1;
+		for (let i = prefix.length - 1; i >= 0; i--) {
+			const entry = prefix[i];
+			if (entry.type === "message" && entry.message.role === "assistant") {
+				assistantIndex = i;
+				break;
+			}
+		}
+		const assistantEntry = assistantIndex >= 0 ? prefix[assistantIndex] : undefined;
+		const actualAssistantEntryId = assistantEntry?.id ?? null;
+		if (actualAssistantEntryId !== authority.assistantEntryId) {
+			return { status: "stale", reason: "assistant" };
+		}
+		const actualToolCalls =
+			assistantEntry?.type === "message" && assistantEntry.message.role === "assistant"
+				? collectUnresolvedToolCalls(assistantEntry.message, prefix.slice(assistantIndex + 1))
+				: [];
+		if (!this._toolCallsEqual(actualToolCalls, authority.toolCalls)) {
+			return { status: "stale", reason: "toolCalls" };
+		}
+
+		// The sole permitted head advance is an ordered prefix of this operation's
+		// synthetic results. Unknown ids, duplicates, reordering, foreign metadata,
+		// and ordinary transcript entries all make the authority stale.
+		const suffix = branch.slice(prefix.length);
+		if (suffix.length > authority.toolCalls.length) {
+			return { status: "stale", reason: "foreign_suffix" };
+		}
+		for (let i = 0; i < suffix.length; i++) {
+			const entry = suffix[i];
+			const expected = authority.toolCalls[i]!;
+			if (entry.type !== "message" || entry.message.role !== "toolResult") {
+				return { status: "stale", reason: "foreign_suffix" };
+			}
+			const result = entry.message as ToolResultMessage;
+			const details = (result as { details?: unknown }).details;
+			const recovery = (details as { recovery?: unknown } | null | undefined)?.recovery;
+			if (
+				result.toolCallId !== expected.id ||
+				result.toolName !== expected.name ||
+				result.isError !== true ||
+				!isRecoveryMetadata(recovery) ||
+				recovery.operationId !== authority.operationId ||
+				recovery.assistantEntryId !== authority.assistantEntryId
+			) {
+				return { status: "stale", reason: "foreign_suffix" };
+			}
+		}
+		const missing = authority.toolCalls.slice(suffix.length);
+		if (missing.length === 0) {
+			return { status: "already_applied" };
+		}
+
+		const metadata: RecoverySyntheticMetadata = {
+			operationId: authority.operationId,
+			assistantEntryId: authority.assistantEntryId,
+		};
+		for (const call of missing) {
+			this.appendMessageWithRollback({
+				role: "toolResult",
+				toolCallId: call.id,
+				toolName: call.name,
+				content: [{ type: "text", text: INTERRUPTED_TOOL_RESULT_TEXT }],
+				isError: true,
+				timestamp: Date.now(),
+				details: { recovery: metadata },
+			});
+		}
+		return { status: "applied", closed: missing.length };
+	}
+
+	private _prefixThrough(headId: string | null, branch: SessionEntry[]): SessionEntry[] | null {
+		if (headId === null) {
+			return [];
+		}
+		const index = branch.findIndex((entry) => entry.id === headId);
+		if (index === -1) return null;
+		return branch.slice(0, index + 1);
+	}
+
+	private _toolCallsEqual(
+		left: ReadonlyArray<ExactRecoveryToolCall>,
+		right: ReadonlyArray<ExactRecoveryToolCall>,
+	): boolean {
+		if (left.length !== right.length) return false;
+		for (let i = 0; i < left.length; i++) {
+			if (left[i]!.id !== right[i]!.id || left[i]!.name !== right[i]!.name) return false;
+		}
+		return true;
+	}
+
 	/** Append a thinking level change as child of current leaf, then advance leaf. Returns entry id. */
 	appendThinkingLevelChange(thinkingLevel: string): string {
 		const entry: ThinkingLevelChangeEntry = {
@@ -2421,4 +2574,109 @@ interface InterruptedToolCall {
 
 function hasToolCallBlocks(message: AssistantMessage): boolean {
 	return message.content.some((block) => block !== null && block.type === "toolCall");
+}
+
+/** A single unresolved tool call declared by an assistant turn and journaled for recovery. */
+export interface ExactRecoveryToolCall {
+	readonly id: string;
+	readonly name: string;
+}
+
+/**
+ * Narrow snapshot of one active-branch view, intended for the journal/daemon-mode
+ * layer to record as part of a busy checkpoint. The journal layer supplies
+ * operationId, activeSessionId, and sessionFile alongside this snapshot.
+ *
+ * Branch-derived fields are computed once from a single in-memory view; the
+ * session-manager does not depend on any journal-specific imports.
+ */
+export interface ExactRecoverySnapshot {
+	/** Persisted session generation id (matches the session header id). */
+	readonly sessionId: string;
+	/** Exact active branch head entry id at capture time, including null for an empty branch. */
+	readonly headEntryId: string | null;
+	/** Latest assistant entry id on the active branch, or null if none. */
+	readonly assistantEntryId: string | null;
+	/** Unresolved tool calls from the latest assistant entry at capture time, in declaration order. */
+	readonly toolCalls: ReadonlyArray<ExactRecoveryToolCall>;
+	/** Deterministic SHA-256 digest over the active branch through headEntryId. */
+	readonly lineageDigest: string;
+}
+
+/** Full exact recovery authority. Combines the snapshot with the journal-bound identity. */
+export interface ExactRecoveryAuthority extends ExactRecoverySnapshot {
+	/** Stable id of this exact-authority busy epoch. */
+	readonly operationId: string;
+	/** Runtime identity of the dead worker, supplied by the catalog/journal layer. */
+	readonly activeSessionId: string;
+	/** Canonical session file path; validated against the current session's path. */
+	readonly sessionFile: string;
+}
+
+/** Metadata carried by synthetic tool results produced by exact recovery. */
+export interface RecoverySyntheticMetadata {
+	readonly operationId: string;
+	readonly assistantEntryId: string | null;
+}
+
+/** Reason a recovery request was rejected as stale. */
+export type ExactRecoveryStaleReason =
+	| "generation"
+	| "sessionFile"
+	| "head"
+	| "lineage"
+	| "assistant"
+	| "toolCalls"
+	| "foreign_suffix";
+
+/** Outcome of an exact-authority recovery request. */
+export type ExactRecoveryStatus =
+	| { readonly status: "applied"; readonly closed: number }
+	| { readonly status: "already_applied" }
+	| { readonly status: "stale"; readonly reason: ExactRecoveryStaleReason };
+
+/** Shape of the recovery metadata stored on a synthetic toolResult.details. */
+function isRecoveryMetadata(value: unknown): value is RecoverySyntheticMetadata {
+	if (!value || typeof value !== "object") return false;
+	const candidate = value as { operationId?: unknown; assistantEntryId?: unknown };
+	if (typeof candidate.operationId !== "string") return false;
+	if (candidate.assistantEntryId !== null && typeof candidate.assistantEntryId !== "string") {
+		return false;
+	}
+	return true;
+}
+
+/** Extract the ordered unresolved tool calls from one assistant turn at a branch prefix. */
+function collectUnresolvedToolCalls(
+	message: AssistantMessage,
+	entriesAfterAssistant: ReadonlyArray<SessionEntry>,
+): ExactRecoveryToolCall[] {
+	const resolved = new Set<string>();
+	for (const entry of entriesAfterAssistant) {
+		if (entry.type !== "message" || entry.message.role !== "toolResult") continue;
+		const result = entry.message as ToolResultMessage;
+		if (typeof result.toolCallId === "string") resolved.add(result.toolCallId);
+	}
+	const calls: ExactRecoveryToolCall[] = [];
+	const seen = new Set<string>();
+	for (const block of message.content) {
+		if (!block || block.type !== "toolCall") continue;
+		if (typeof block.id !== "string" || typeof block.name !== "string") continue;
+		if (seen.has(block.id) || resolved.has(block.id)) continue;
+		seen.add(block.id);
+		calls.push({ id: block.id, name: block.name });
+	}
+	return calls;
+}
+
+/** Compute the deterministic lineage digest for the entries on the active branch prefix. */
+function computeLineageDigest(prefix: SessionEntry[]): string {
+	const hash = createHash("sha256");
+	for (const entry of prefix) {
+		hash.update(entry.id);
+		hash.update("\0");
+		hash.update(entry.parentId ?? "");
+		hash.update("\0");
+	}
+	return hash.digest("hex");
 }

@@ -6285,10 +6285,15 @@ export class AgentDaemon {
 		const busy =
 			busyOverride ?? (isActiveSessionBusy(state) || session.isRetrying || session.hasAcceptedPromptInFlight);
 		try {
+			// SessionManager captures every branch-derived authority field from one
+			// in-memory view so checkpoint and recovery use the same digest and
+			// unresolved-call semantics.
+			const snapshot = session.sessionManager.captureExactRecoveryAuthority(state.activeSessionId, "");
 			this.recoveryJournal.record({
 				activeSessionId: state.activeSessionId,
-				sessionId: session.sessionId,
-				...(session.sessionFile ? { sessionFile: session.sessionFile } : {}),
+				...snapshot,
+				agentDir: this.agentDir,
+				...(session.sessionFile ? { sessionFile: canonicalSessionPath(session.sessionFile) } : {}),
 				busy,
 				operation,
 			});
