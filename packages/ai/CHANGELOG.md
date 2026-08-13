@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - Fixed OpenAI-compatible streams ending without a terminal finish_reason being recorded as successful completions.
+- Added direct MiniMax-M3 model registrations for the `minimax` and `minimax-cn` providers.
 
 ## [0.7.2] - 2026-08-11
 
