@@ -224,6 +224,7 @@ import {
 	findRlmModelMatches,
 	normalizeRequestedRlmSubagentModel,
 	normalizeRequestedRlmSubagentSessionName,
+	normalizeRequestedRlmSubagentThinkingLevel,
 	type RlmDeleteSubagentResult,
 	type RlmFindModelsResult,
 	type RlmListSubagentsResult,
@@ -9069,6 +9070,7 @@ export class AgentSession {
 		spawnCode?: string;
 		sessionDir: string;
 		model: Model<any>;
+		thinkingLevel: ThinkingLevel;
 	}): CreateRlmSubagentRuntimeOptions {
 		return {
 			parentSession: this,
@@ -9078,7 +9080,7 @@ export class AgentSession {
 			spawnCode: options.spawnCode,
 			sessionDir: options.sessionDir,
 			model: options.model,
-			thinkingLevel: clampThinkingLevel(options.model, this.thinkingLevel) as ThinkingLevel,
+			thinkingLevel: options.thinkingLevel,
 			serviceTier:
 				this.serviceTier === "priority" && !supportsFastMode(options.model) ? "default" : this.serviceTier,
 			scopedModels: [...this._scopedModels],
@@ -9737,6 +9739,23 @@ export class AgentSession {
 		return { model };
 	}
 
+	private _resolveRlmSubagentThinkingLevel(
+		model: Model<Api>,
+		requestedLevel: ThinkingLevel | undefined,
+	): ThinkingLevel {
+		if (requestedLevel === undefined) {
+			return clampThinkingLevel(model, this.thinkingLevel) as ThinkingLevel;
+		}
+		const availableLevels = getSupportedThinkingLevels(model) as ThinkingLevel[];
+		if (!availableLevels.includes(requestedLevel)) {
+			const selector = `${model.provider}/${model.id}`;
+			throw new Error(
+				`Requested subagent thinking level "${requestedLevel}" is unsupported by model "${selector}". Available: ${availableLevels.join(", ")}`,
+			);
+		}
+		return requestedLevel;
+	}
+
 	private async _startRlmChildRun(
 		prompt: string,
 		kwargs: Record<string, unknown> = {},
@@ -9744,13 +9763,14 @@ export class AgentSession {
 		signal?: AbortSignal,
 	): Promise<RlmSpawnHandle> {
 		throwIfHostRequestAborted(signal);
-		const { name: rawName, model: rawModel, ...unsupported } = kwargs;
+		const { name: rawName, model: rawModel, thinking_level: rawThinkingLevel, ...unsupported } = kwargs;
 		const unsupportedKwargs = Object.keys(unsupported);
 		if (unsupportedKwargs.length > 0) {
 			throw new Error(`Unsupported rlm.run kwargs: ${unsupportedKwargs.sort().join(", ")}`);
 		}
 		const requestedSessionName = normalizeRequestedRlmSubagentSessionName(rawName);
 		const requestedModel = normalizeRequestedRlmSubagentModel(rawModel);
+		const requestedThinkingLevel = normalizeRequestedRlmSubagentThinkingLevel(rawThinkingLevel);
 		if (requestedSessionName) assertDirectAgentMessageTarget(requestedSessionName);
 		if (this._rlmDepth >= this._rlmMaxDepth) {
 			throw new Error(
@@ -9764,11 +9784,13 @@ export class AgentSession {
 			this._pendingRlmSubagentSessionNames.add(requestedSessionName);
 		}
 		let modelSelection: RlmSubagentModelSelection;
+		let thinkingLevel: ThinkingLevel;
 		try {
 			if (requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(requestedSessionName, true);
 			throwIfHostRequestAborted(signal);
 			modelSelection = await this._resolveRlmSubagentModel(requestedModel);
 			throwIfHostRequestAborted(signal);
+			thinkingLevel = this._resolveRlmSubagentThinkingLevel(modelSelection.model, requestedThinkingLevel);
 		} finally {
 			if (requestedSessionName) this._pendingRlmSubagentSessionNames.delete(requestedSessionName);
 		}
@@ -9848,6 +9870,7 @@ export class AgentSession {
 				spawnCode,
 				sessionDir: childSessionDir,
 				model: modelSelection.model,
+				thinkingLevel,
 			}),
 			onSessionPublished: publishChildSession,
 		};

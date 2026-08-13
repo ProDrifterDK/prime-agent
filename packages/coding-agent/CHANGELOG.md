@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Added optional `thinking_level` selection to `rlm(...)`, with inherited defaults and fail-closed explicit values ([#1196](https://github.com/PrimeIntellect-ai/prime-agent/pull/1196) by [@ProDrifterDK](https://github.com/ProDrifterDK)).
 - Fixed URLs not opening on click in fullscreen mode on terminals such as Ghostty; clicking a link in the transcript, dock, or overlays now opens it in the browser.
 - Fixed IPython host bridge requests hanging indefinitely when a request, handler, or response is lost, with a configurable 120-second deadline and safe cleanup ([#848](https://github.com/PrimeIntellect-ai/prime-agent/issues/848)).
 - Fixed completed IPython cells blocking the serial execution queue when Jupyter drops the matching IOPub idle event ([#848](https://github.com/PrimeIntellect-ai/prime-agent/issues/848)).
