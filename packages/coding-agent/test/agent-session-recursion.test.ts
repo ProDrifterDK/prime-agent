@@ -2893,6 +2893,34 @@ describe("AgentSession rlm recursion", () => {
 		await waitFor(() => rootRun.status === "done");
 	});
 
+	it("propagates host aborts through the rlm admission adapter", async () => {
+		let receivedSignal: AbortSignal | undefined;
+		let release: () => void = () => {};
+		const handler = createRlmRunHostHandler(async (_request, signal) => {
+			receivedSignal = signal;
+			await new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			return {};
+		});
+		const controller = new AbortController();
+		const request = handler(
+			{ type: "rlm.run", prompt: "work", kwargs: {} },
+			{
+				requestId: "test-rlm-run-abort",
+				generation: 1,
+				signal: controller.signal,
+				isCurrent: () => !controller.signal.aborted,
+			},
+		);
+		await Promise.resolve();
+		expect(receivedSignal).toBe(controller.signal);
+
+		controller.abort(new Error("host request timed out"));
+		release();
+		await expect(request).rejects.toThrow("host request timed out");
+	});
+
 	it("runs parallel rlm comm requests independently", async () => {
 		let active = 0;
 		let maxActive = 0;
