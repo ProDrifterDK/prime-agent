@@ -3324,6 +3324,38 @@ describe("daemon worker supervisor monitoring", () => {
 		}
 	});
 
+	it("worker recovery retains busy authority while the killed session owner still holds its lease", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-recovery-live-owner-"));
+		const journalPath = join(root, "worker.recovery.jsonl");
+		const journal = new WorkerRecoveryJournal(journalPath);
+		journal.record(recoveryRecord(root, "root-active", "root-session", "/tmp/root.jsonl", "tool_execution"));
+		const markInterrupted = vi
+			.fn()
+			.mockResolvedValueOnce({ status: "stale" as const, reason: "live_session_owner" as const })
+			.mockResolvedValueOnce({ status: "stale" as const, reason: "live_session_owner" as const });
+		const worker = recoveryWorker(root, journalPath);
+		worker.descriptor.pid = 2_147_483_647;
+		const supervisor = recoverySupervisor(markInterrupted);
+
+		try {
+			await expect(supervisor.recoverUncertainWorkerOperations(worker, true)).rejects.toThrow(/session owner lease/);
+			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({
+				busy: true,
+				operation: "tool_execution",
+			});
+
+			await supervisor.recoverUncertainWorkerOperations(worker, false);
+			expect(markInterrupted).toHaveBeenCalledTimes(2);
+			expect(markInterrupted.mock.calls[1]?.[0]).toEqual(markInterrupted.mock.calls[0]?.[0]);
+			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({
+				busy: false,
+				operation: "recovery_complete",
+			});
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("worker recovery keeps per-session successes complete when a sibling request fails", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-recovery-partial-"));
 		const journalPath = join(root, "worker.recovery.jsonl");
