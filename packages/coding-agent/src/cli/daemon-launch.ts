@@ -66,8 +66,13 @@ type DaemonVersionProbe =
 	| { status: "current"; hello: DaemonHello }
 	| { status: "stale"; hello?: DaemonHello };
 
-/** Connect to a running daemon and check whether it matches this client's protocol and app version. */
-export async function probeDaemonVersion(socketPath: string): Promise<DaemonVersionProbe> {
+interface ConnectedDaemonVersionProbe {
+	probe: DaemonVersionProbe;
+	client?: DaemonClient;
+}
+
+/** Connect once and keep that exact connection open for any stale replacement. */
+async function probeDaemonVersionConnection(socketPath: string): Promise<ConnectedDaemonVersionProbe> {
 	let client: DaemonClient | undefined;
 	for (const timeoutMs of [250, 2000]) {
 		const candidate = new DaemonClient(socketPath);
@@ -80,7 +85,7 @@ export async function probeDaemonVersion(socketPath: string): Promise<DaemonVers
 		}
 	}
 	if (!client) {
-		return { status: "absent" };
+		return { probe: { status: "absent" } };
 	}
 	try {
 		const hello = await client.waitForHello(2000);
@@ -95,17 +100,20 @@ export async function probeDaemonVersion(socketPath: string): Promise<DaemonVers
 					`v${VERSION}/proto${DAEMON_PROTOCOL_VERSION}/schema ${DAEMON_SCHEMA_ID}/build ${getDaemonRuntimeIdentity().buildId}`,
 			);
 		}
-		if (current) {
-			return { status: "current", hello };
-		}
-		return { status: "stale", hello };
+		return { probe: current ? { status: "current", hello } : { status: "stale", hello }, client };
 	} catch {
-		// Connected but no recognizable greeting: assume a stale daemon.
+		// Connected but no recognizable greeting: assume stale, while preserving
+		// this exact connection so no successor can inherit the stale verdict.
 		logDaemonLaunch(`running daemon on ${socketPath} sent no recognizable hello; treating as stale`);
-		return { status: "stale" };
-	} finally {
-		client.close();
+		return { probe: { status: "stale" }, client };
 	}
+}
+
+/** Connect to a running daemon and check whether it matches this client. */
+export async function probeDaemonVersion(socketPath: string): Promise<DaemonVersionProbe> {
+	const connected = await probeDaemonVersionConnection(socketPath);
+	connected.client?.close();
+	return connected.probe;
 }
 
 export async function listActiveDaemonSessionSummaries(
@@ -238,17 +246,24 @@ export async function shutdownConnectedDaemonAndWait(
 	client: DaemonClient,
 	socketPath: string,
 	timeoutMs = 5000,
-	hello: DaemonHello | undefined = client.hello,
 ): Promise<boolean> {
 	let shutdownAccepted = false;
-	const expectedIdentity = processIdentityFromDaemonHello(hello);
+	let shutdownRejected = false;
+	let expectedIdentity: DaemonProcessIdentity | undefined;
 	try {
-		const response = await client.request({ type: "shutdown" }).catch(() => undefined);
-		shutdownAccepted = response?.success === true;
+		const hello = client.hello ?? (await client.waitForHello());
+		expectedIdentity = processIdentityFromDaemonHello(hello);
+		const response = await client.requestSupervisorShutdown();
+		shutdownAccepted = response.success;
+		shutdownRejected = !response.success;
 	} catch {
-		// A connect failure isn't treated as "gone"; waitForDaemonGone is the source of truth.
+		// A disconnect before a response remains uncertain; waitForDaemonGone is
+		// the source of truth only when the daemon did not explicitly reject.
 	} finally {
 		client.close();
+	}
+	if (shutdownRejected) {
+		return false;
 	}
 	return waitForDaemonGone(socketPath, timeoutMs, shutdownAccepted, expectedIdentity);
 }
@@ -257,8 +272,7 @@ export async function shutdownDaemonAndWait(socketPath: string, timeoutMs = 5000
 	const client = new DaemonClient(socketPath);
 	try {
 		await client.connect(1000);
-		const hello = await client.waitForHello(2000).catch(() => undefined);
-		return shutdownConnectedDaemonAndWait(client, socketPath, timeoutMs, hello);
+		return shutdownConnectedDaemonAndWait(client, socketPath, timeoutMs);
 	} catch {
 		client.close();
 		return waitForDaemonGone(socketPath, timeoutMs);
@@ -301,49 +315,41 @@ export async function probeRunningDaemonSessions(socketPath: string): Promise<Ru
 
 // Idle-but-loaded sessions reload from disk on the fresh daemon, so only a busy
 // session blocks replacing a stale daemon.
-async function shutdownStaleDaemonIfNotBusy(socketPath: string): Promise<boolean> {
-	const client = new DaemonClient(socketPath);
-	let connected = false;
+async function shutdownStaleDaemonIfNotBusy(client: DaemonClient, socketPath: string): Promise<boolean> {
 	let hasBusySessions = false;
 	let loadedSessionCount = 0;
 	try {
-		await client.connect(1000);
-		connected = true;
-		try {
-			const result = await queryActiveDaemonSessions(client, { includeClientOwned: true });
-			loadedSessionCount = result.sessions.length;
-			hasBusySessions =
-				result.busyClientOwnedSessionCount !== 0 || result.sessions.some((summary) => isSessionBusy(summary));
-		} catch {
-			// Couldn't confirm idleness: treat as busy rather than risk interrupting work.
-			hasBusySessions = true;
-		}
+		const result = await queryActiveDaemonSessions(client, { includeClientOwned: true });
+		loadedSessionCount = result.sessions.length;
+		hasBusySessions =
+			result.busyClientOwnedSessionCount !== 0 || result.sessions.some((summary) => isSessionBusy(summary));
 	} catch {
-		// Couldn't reach it to inspect; don't send a blind shutdown, just verify below.
-	} finally {
-		client.close();
-	}
-
-	if (!connected) {
-		return waitForDaemonGone(socketPath);
+		// Couldn't confirm idleness on the probed connection: fail closed instead
+		// of reconnecting and applying its stale verdict to a possible successor.
+		hasBusySessions = true;
 	}
 	if (hasBusySessions) {
+		client.close();
 		logDaemonLaunch(`refusing to replace stale daemon on ${socketPath}: busy session(s) present`);
 		return false;
 	}
 	logDaemonLaunch(
 		`replacing stale daemon on ${socketPath} (idle): ${loadedSessionCount} loaded session(s) will reload`,
 	);
-	return shutdownDaemonAndWait(socketPath);
+	return shutdownConnectedDaemonAndWait(client, socketPath, 5000);
 }
 
 async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promise<void> {
-	const probe = await probeDaemonVersion(socketPath);
+	const connected = await probeDaemonVersionConnection(socketPath);
+	const { probe } = connected;
 	if (probe.status === "current") {
+		connected.client?.close();
 		return;
 	}
 	if (probe.status === "stale") {
-		const stopped = await shutdownStaleDaemonIfNotBusy(socketPath);
+		const client = connected.client;
+		if (!client) throw new StaleDaemonError(socketPath, probe.hello);
+		const stopped = await shutdownStaleDaemonIfNotBusy(client, socketPath);
 		if (!stopped) throw new StaleDaemonError(socketPath, probe.hello);
 	}
 

@@ -26,7 +26,7 @@ describe("daemon protocol helpers", () => {
 	it("keeps the advertised schema identity synchronized with wire type shapes", () => {
 		const source = readFileSync(resolve(__dirname, "../src/modes/daemon/daemon-protocol.ts"), "utf8");
 		const commandSource = source.slice(
-			source.indexOf("export type DaemonCommand ="),
+			source.indexOf("export interface DaemonShutdownAuthority"),
 			source.indexOf("type DaemonCommandName"),
 		);
 		const savedSessionSource = source.slice(
@@ -136,6 +136,15 @@ describe("daemon protocol helpers", () => {
 		// ignore unknown values, so no capability gate is needed; the revision
 		// lets version probes distinguish daemons with the old semantics.
 		expect(DAEMON_SCHEMA_REVISION).toBeGreaterThanOrEqual(16);
+	});
+
+	it("adds complete supervisor termination authority at its introducing schema revision", () => {
+		// Revision 18 extends authority to restart and requires the full process
+		// identity. Both commands stay legacy-compatible so a new client may send
+		// the authority-optional shape to an older tolerant supervisor.
+		expect(DAEMON_SCHEMA_REVISION).toBeGreaterThanOrEqual(18);
+		expect(DAEMON_COMMAND_COMPATIBILITY.restart).toEqual({ minProtocol: 7 });
+		expect(DAEMON_COMMAND_COMPATIBILITY.shutdown).toEqual({ minProtocol: 7 });
 	});
 
 	it("keeps refine failure events backward-compatible on the existing session event channel", () => {

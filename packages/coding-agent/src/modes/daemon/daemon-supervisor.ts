@@ -55,7 +55,7 @@ import {
 	DAEMON_CATALOG_ROLE_ENV,
 	DaemonCatalogClient,
 } from "./daemon-catalog-process.js";
-import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
+import { DaemonShutdownAuthorityError, deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
 import {
 	collectDaemonClientEnv,
 	createDaemonEventMeta,
@@ -73,6 +73,7 @@ import {
 	type DaemonCommand,
 	type DaemonOutbound,
 	type DaemonResponse,
+	type DaemonShutdownAuthority,
 	type DaemonUpdateRestartManifest,
 	failure,
 	isDaemonCommandEnvelope,
@@ -103,6 +104,7 @@ import {
 import {
 	acquireDaemonSupervisorOwnership,
 	isDaemonShutdownAdmissionActive,
+	normalizeDaemonSupervisorSocketPath,
 	waitForDaemonStartupFence,
 } from "./daemon-supervisor-ownership.js";
 import { DaemonWorkerClient } from "./daemon-worker-client.js";
@@ -903,6 +905,35 @@ export class DaemonSupervisor {
 		}
 	}
 
+	/**
+	 * Fail-closed gate for every public supervisor-termination command. Requires
+	 * the exact durable identity observed on the same connection's handshake,
+	 * reasserts current ownership so a generation that already lost ownership
+	 * cannot accept termination commands, and rejects missing, malformed,
+	 * incomplete, or mismatched authority before any shutdown is scheduled.
+	 * The force flag changes worker-drain behavior only; it never bypasses
+	 * this gate.
+	 */
+	private async assertShutdownAuthority(authority: DaemonShutdownAuthority | undefined): Promise<void> {
+		if (!isCompleteDaemonShutdownAuthority(authority)) {
+			throw new DaemonShutdownAuthorityError();
+		}
+		await this.assertCurrentOwnership();
+		const record = this.ownership?.record;
+		if (!record) {
+			throw new DaemonShutdownAuthorityError();
+		}
+		if (
+			authority.supervisorGeneration !== record.generation ||
+			authority.supervisorOwnerToken !== record.token ||
+			authority.supervisorPid !== record.pid ||
+			authority.supervisorProcessStartId !== record.processStartId ||
+			normalizeDaemonSupervisorSocketPath(authority.supervisorSocketPath) !== record.socketPath
+		) {
+			throw new DaemonShutdownAuthorityError();
+		}
+	}
+
 	private supervisorAuthenticationClaim(): {
 		supervisorGeneration: string;
 		supervisorPid: number;
@@ -1574,9 +1605,11 @@ export class DaemonSupervisor {
 				return success(command.id, command.type, summary ? this.publicSummary(worker, summary) : undefined);
 			}
 			case "restart":
+				await this.assertShutdownAuthority(command.authority);
 				setImmediate(() => void this.shutdown(0, false, true, false, "update"));
 				return success(command.id, command.type);
 			case "shutdown":
+				await this.assertShutdownAuthority(command.authority);
 				setImmediate(() => void this.shutdown(0, true, false, command.force === true, "shutdown"));
 				return success(command.id, "shutdown");
 			case "prepare_update_restart": {
@@ -5203,4 +5236,23 @@ export class DaemonSupervisor {
 		}
 		process.exit(exitCode);
 	}
+}
+
+function isCompleteDaemonShutdownAuthority(value: unknown): value is DaemonShutdownAuthority {
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	const authority = value as Partial<DaemonShutdownAuthority>;
+	return (
+		typeof authority.supervisorGeneration === "string" &&
+		authority.supervisorGeneration.length > 0 &&
+		typeof authority.supervisorOwnerToken === "string" &&
+		authority.supervisorOwnerToken.length > 0 &&
+		Number.isInteger(authority.supervisorPid) &&
+		(authority.supervisorPid ?? 0) > 0 &&
+		typeof authority.supervisorProcessStartId === "string" &&
+		authority.supervisorProcessStartId.length > 0 &&
+		typeof authority.supervisorSocketPath === "string" &&
+		authority.supervisorSocketPath.length > 0
+	);
 }

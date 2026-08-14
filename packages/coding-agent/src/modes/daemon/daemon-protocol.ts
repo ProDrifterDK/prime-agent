@@ -60,8 +60,12 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 14 carries the client's monotonic telemetry opt-out on attach and reattach.
 // Revision 15 adds the mutate_queued_message command and queue_message_mutation capability.
 // Revision 16 adds the "stopping" workerState and stops reporting disconnected workers as "ready".
-export const DAEMON_SCHEMA_REVISION = 16;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-16-1bcb9e7f1a49";
+// Revision 17 adds supervisor shutdown authority: the public shutdown command may
+// carry the exact supervisor identity observed on the same connection's handshake.
+// Revision 18 applies the same authority to public restart and requires the full
+// process-start identity for every authority-bearing termination command.
+export const DAEMON_SCHEMA_REVISION = 18;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-18-2dae6dbd5404";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -346,6 +350,34 @@ export type DaemonSavedSessionListCommand =
 			scope: AgentConnectionSavedSessionScope;
 	  };
 
+/**
+ * The exact durable supervisor identity a client observes in `daemon_hello`.
+ * Every public command that terminates the supervisor carries it so connection
+ * access alone is not authority to terminate whichever owner has the socket.
+ */
+export interface DaemonShutdownAuthority {
+	supervisorGeneration: string;
+	supervisorOwnerToken: string;
+	supervisorPid: number;
+	supervisorProcessStartId: string;
+	supervisorSocketPath: string;
+}
+
+export type DaemonRestartCommand = {
+	id?: string;
+	type: "restart";
+	/** Optional only for forward upgrade compatibility with legacy supervisors. */
+	authority?: DaemonShutdownAuthority;
+};
+
+export type DaemonShutdownCommand = {
+	id?: string;
+	type: "shutdown";
+	force?: boolean;
+	/** Optional only for forward upgrade compatibility with legacy supervisors. */
+	authority?: DaemonShutdownAuthority;
+};
+
 export type DaemonCommand =
 	| {
 			id?: string;
@@ -616,8 +648,8 @@ export type DaemonCommand =
 	| { id?: string; type: "ack_result"; commandId: string }
 	| { id?: string; type: "prepare_update_restart" }
 	| { id?: string; type: "retry_worker"; activeSessionId: string }
-	| { id?: string; type: "restart" }
-	| { id?: string; type: "shutdown"; force?: boolean };
+	| DaemonRestartCommand
+	| DaemonShutdownCommand;
 
 type DaemonCommandName = DaemonCommand["type"];
 
@@ -780,7 +812,8 @@ export type DaemonErrorInfo =
 	| { code: "missing_session_cwd"; issue: SessionCwdIssue }
 	| { code: "session_import_file_not_found"; filePath: string }
 	| { code: "session_already_active"; sessionPath: string; activeSessionId?: string }
-	| { code: "command_result_uncertain"; clientId: DaemonClientId; commandId: DaemonCommandId };
+	| { code: "command_result_uncertain"; clientId: DaemonClientId; commandId: DaemonCommandId }
+	| { code: "shutdown_authority_rejected" };
 
 export type DaemonSessionClosedReason = "killed" | "shutdown" | "completed" | "replaced" | "update";
 export type DaemonClosingReason = "shutdown" | "update";

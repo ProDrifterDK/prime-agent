@@ -240,7 +240,7 @@ async function runDaemonClientCommand(parsed: ParsedDaemonClientCommand): Promis
 				if (parsed.positionals.length !== 0) {
 					throw new Error("Usage: daemon restart");
 				}
-				await printResponseData(client, { type: "restart" }, parsed.json);
+				printResponse(await client.requestSupervisorRestart(), parsed.json);
 				return;
 			case "shutdown":
 				await runShutdown(client, parsed.positionals, parsed.json);
@@ -260,7 +260,7 @@ async function runShutdown(client: DaemonClient, args: string[], json: boolean):
 		}
 		throw new Error(`Unknown shutdown option: ${arg}`);
 	}
-	await printResponseData(client, { type: "shutdown", force }, json);
+	printResponse(await client.requestSupervisorShutdown(force), json);
 }
 
 async function runOpen(parsed: ParsedDaemonClientCommand): Promise<void> {
@@ -1096,7 +1096,10 @@ async function printResponseData(
 	command: Parameters<DaemonClient["request"]>[0],
 	json: boolean,
 ): Promise<void> {
-	const response = await client.request(command);
+	printResponse(await client.request(command), json);
+}
+
+function printResponse(response: DaemonResponse, json: boolean): void {
 	const data = requireSuccess(response);
 	if (json || data !== undefined) {
 		printJson(data ?? response);

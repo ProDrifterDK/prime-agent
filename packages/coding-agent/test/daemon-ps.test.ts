@@ -1,10 +1,15 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
 	type DaemonInfo,
 	evaluateShutdownQuietPeriod,
+	isProtectedDaemonAction,
 	isWorkerSocketPath,
 	mergeDiscoveredDaemonProcesses,
+	orderShutdownActions,
 	parseLsofListeners,
 	parsePrimeAgentProcessIds,
 	parsePsEtimes,
@@ -12,10 +17,15 @@ import {
 	planReap,
 	planShutdownAll,
 	planShutdownConfirmation,
+	protectAuthorityRejectedScope,
+	reapOutcomeFromShutdownAttempt,
+	shutdownDaemon,
 	sortDaemons,
 	verifyHelloSupervisorPid,
 } from "../src/cli/daemon-ps.js";
+import { ENV_AGENT_DIR } from "../src/config.js";
 import { getProcessStartId } from "../src/core/session-lease.js";
+import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../src/modes/daemon/daemon-protocol.js";
 import { defaultDaemonSocketDir } from "../src/modes/daemon/daemon-socket.js";
 
 describe("worker socket classification", () => {
@@ -258,6 +268,139 @@ describe("planShutdownConfirmation", () => {
 		expect(planShutdownConfirmation(1, false, false, false)).toBe("tty-error");
 		expect(planShutdownConfirmation(1, true, true, true)).toBe("none");
 		expect(planShutdownConfirmation(0, false, false, true)).toBe("none");
+	});
+});
+
+describe("shutdownDaemon authority outcome", () => {
+	it("never treats a structured rejection object as successful reap", () => {
+		expect(reapOutcomeFromShutdownAttempt({ status: "authority-rejected" }, 42)).toEqual({
+			skipped: "shutdown authority rejected",
+			preserveTrackedWorkers: true,
+		});
+		expect(reapOutcomeFromShutdownAttempt({ status: "stopped" }, 42)).toEqual({
+			reaped: "stopped idle background service (pid 42)",
+		});
+	});
+
+	it("protects the rejected supervisor and every tracked worker listener", () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-daemon-ps-protected-scope-"));
+		const previousAgentDir = process.env[ENV_AGENT_DIR];
+		const supervisorSocketPath = join(directory, "supervisor.sock");
+		const workerSocketPath = join(directory, "worker.sock");
+		const descriptorDirectory = join(directory, "daemon-workers", "scope");
+		mkdirSync(descriptorDirectory, { recursive: true });
+		const workerPid = 987654321;
+		writeFileSync(
+			join(descriptorDirectory, "worker.json"),
+			JSON.stringify({
+				version: 1,
+				supervisorSocketPath,
+				workerId: "worker",
+				pid: workerPid,
+				processStartId: "worker-start",
+				socketPath: workerSocketPath,
+				recoveryJournalPath: join(directory, "recovery.jsonl"),
+			}),
+		);
+		try {
+			process.env[ENV_AGENT_DIR] = directory;
+			const workerDaemon = {
+				socketPath: workerSocketPath,
+				pid: workerPid,
+				status: "unreachable" as const,
+				isDefault: false,
+			};
+			const supervisorDaemon = {
+				socketPath: supervisorSocketPath,
+				pid: process.pid,
+				status: "current" as const,
+				isDefault: false,
+			};
+			const ordered = orderShutdownActions(
+				[
+					{ kind: "kill", daemon: workerDaemon },
+					{ kind: "shutdown", daemon: supervisorDaemon },
+				],
+				new Set([workerSocketPath]),
+				new Map([[workerPid, "worker-start"]]),
+			);
+			expect(ordered.map((action) => action.daemon.socketPath)).toEqual([supervisorSocketPath, workerSocketPath]);
+
+			const sockets = new Set<string>();
+			const processes = new Map<number, string | undefined>();
+			protectAuthorityRejectedScope(supervisorSocketPath, process.pid, sockets, processes);
+			expect(sockets).toEqual(new Set([supervisorSocketPath, workerSocketPath]));
+			expect(processes.get(process.pid)).toBe(getProcessStartId(process.pid));
+			expect(processes.get(workerPid)).toBe("worker-start");
+			expect(isProtectedDaemonAction(workerDaemon, sockets, processes)).toBe(true);
+			expect(
+				isProtectedDaemonAction(
+					{ socketPath: join(directory, "secondary.sock"), pid: process.pid },
+					sockets,
+					processes,
+				),
+			).toBe(true);
+		} finally {
+			if (previousAgentDir === undefined) delete process.env[ENV_AGENT_DIR];
+			else process.env[ENV_AGENT_DIR] = previousAgentDir;
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	it("surfaces authority rejection instead of treating a responsive supervisor as unresponsive", async () => {
+		if (process.platform === "win32") return;
+		const directory = mkdtempSync(join(tmpdir(), "prime-daemon-ps-authority-"));
+		const socketPath = join(directory, "daemon.sock");
+		const server = createServer((socket) => {
+			socket.on("error", () => undefined);
+			socket.write(
+				`${JSON.stringify({
+					type: "daemon_hello",
+					socketPath,
+					protocol: { name: "prime-agent.daemon", version: DAEMON_PROTOCOL_VERSION },
+					appVersion: "test",
+					schemaId: DAEMON_SCHEMA_ID,
+					schemaRevision: 18,
+					supervisorGeneration: "generation",
+					supervisorOwnerToken: "owner-token",
+					supervisorPid: process.pid,
+					supervisorProcessStartId: getProcessStartId(process.pid) ?? "test-start",
+					supervisorSocketPath: socketPath,
+					clientId: "client",
+					serverCapabilities: [],
+				})}\n`,
+			);
+			let buffer = "";
+			let responded = false;
+			socket.on("data", (chunk) => {
+				if (responded) return;
+				buffer += chunk.toString();
+				const newline = buffer.indexOf("\n");
+				if (newline === -1) return;
+				const wire = JSON.parse(buffer.slice(0, newline)) as { id: string; command?: { type?: string } };
+				if (wire.command?.type !== "shutdown") return;
+				responded = true;
+				socket.write(
+					`${JSON.stringify({
+						id: wire.id,
+						type: "response",
+						command: "shutdown",
+						success: false,
+						error: "authority rejected",
+						errorInfo: { code: "shutdown_authority_rejected" },
+					})}\n`,
+				);
+			});
+		});
+		try {
+			await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+			await expect(shutdownDaemon(socketPath, true)).resolves.toEqual({ status: "authority-rejected" });
+			expect(server.listening).toBe(true);
+		} finally {
+			(server as typeof server & { closeAllConnections?: () => void }).closeAllConnections?.();
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+			rmSync(directory, { recursive: true, force: true });
+		}
 	});
 });
 

@@ -14,8 +14,11 @@ import {
 	type DaemonProtocolVersion,
 	type DaemonRequestProgress,
 	type DaemonResponse,
+	type DaemonRestartCommand,
 	type DaemonSavedSessionInfo,
 	type DaemonServerCapability,
+	type DaemonShutdownAuthority,
+	type DaemonShutdownCommand,
 	getDaemonCommandCompatibilities,
 	isDaemonMutatingCommand,
 } from "./daemon-protocol.js";
@@ -27,6 +30,62 @@ type DaemonCommandBody = DistributiveOmit<DaemonCommand, "id">;
 type DaemonWireCommandBody = DaemonCommandBody | DaemonWorkerCommandBody;
 
 export type DaemonHello = Extract<DaemonOutbound, { type: "daemon_hello" }>;
+
+/**
+ * Derive the public supervisor shutdown authority from the handshake observed
+ * on this connection. Returns undefined when the handshake lacks any required
+ * identity component (a legacy supervisor), so callers emit the legacy
+ * command shape without authority and preserve forward-upgrade replacement.
+ */
+export function daemonShutdownAuthorityFromHello(hello: DaemonHello | undefined): DaemonShutdownAuthority | undefined {
+	if (
+		!hello ||
+		typeof hello.supervisorGeneration !== "string" ||
+		hello.supervisorGeneration.length === 0 ||
+		typeof hello.supervisorOwnerToken !== "string" ||
+		hello.supervisorOwnerToken.length === 0 ||
+		typeof hello.supervisorPid !== "number" ||
+		!Number.isInteger(hello.supervisorPid) ||
+		hello.supervisorPid <= 0 ||
+		typeof hello.supervisorProcessStartId !== "string" ||
+		hello.supervisorProcessStartId.length === 0 ||
+		typeof hello.supervisorSocketPath !== "string" ||
+		hello.supervisorSocketPath.length === 0
+	) {
+		return undefined;
+	}
+	return {
+		supervisorGeneration: hello.supervisorGeneration,
+		supervisorOwnerToken: hello.supervisorOwnerToken,
+		supervisorPid: hello.supervisorPid,
+		supervisorProcessStartId: hello.supervisorProcessStartId,
+		supervisorSocketPath: hello.supervisorSocketPath,
+	};
+}
+
+/**
+ * Shared builder for every public supervisor shutdown command. Explicit CLI
+ * shutdown, stale-daemon replacement, process/status cleanup utilities, and
+ * update/test cleanup paths all construct the command through this helper so
+ * authority always comes from the same connection's handshake and a legacy
+ * supervisor keeps receiving the legacy wire shape.
+ */
+export function createDaemonRestartCommand(hello: DaemonHello | undefined): DaemonRestartCommand {
+	const authority = daemonShutdownAuthorityFromHello(hello);
+	return {
+		type: "restart",
+		...(authority ? { authority } : {}),
+	};
+}
+
+export function createDaemonShutdownCommand(hello: DaemonHello | undefined, force?: boolean): DaemonShutdownCommand {
+	const authority = daemonShutdownAuthorityFromHello(hello);
+	return {
+		type: "shutdown",
+		...(force ? { force: true } : {}),
+		...(authority ? { authority } : {}),
+	};
+}
 
 export type DaemonClientMessageListener = (message: DaemonOutbound) => void;
 export type DaemonClientCloseListener = (error: Error) => void;
@@ -288,6 +347,16 @@ export class DaemonClient {
 	enableAutoReconnect(options: DaemonClientReconnectOptions): void {
 		this.requestRecoveryEnabled = true;
 		this.reconnectOptions = options;
+	}
+
+	async requestSupervisorRestart(timeoutMs = 30000): Promise<DaemonResponse> {
+		const hello = this.helloMessage ?? (await this.waitForHello());
+		return this.request(createDaemonRestartCommand(hello), timeoutMs);
+	}
+
+	async requestSupervisorShutdown(force = false, timeoutMs = 30000): Promise<DaemonResponse> {
+		const hello = this.helloMessage ?? (await this.waitForHello());
+		return this.request(createDaemonShutdownCommand(hello, force), timeoutMs);
 	}
 
 	async request(

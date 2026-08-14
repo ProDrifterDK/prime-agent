@@ -493,6 +493,30 @@ export function planShutdownAll(daemons: readonly DaemonInfo[], force: boolean):
 	});
 }
 
+export function isProtectedDaemonAction(
+	daemon: Pick<DaemonInfo, "socketPath" | "pid">,
+	protectedSockets: ReadonlySet<string>,
+	protectedProcesses: ReadonlyMap<number, string | undefined>,
+): boolean {
+	if (protectedSockets.has(normalizeSocketPath(daemon.socketPath))) return true;
+	if (daemon.pid === undefined || !protectedProcesses.has(daemon.pid)) return false;
+	const expectedStartId = protectedProcesses.get(daemon.pid);
+	return expectedStartId === undefined || getProcessStartId(daemon.pid) === expectedStartId;
+}
+
+export function orderShutdownActions(
+	actions: readonly ReapAction[],
+	dependentSockets: ReadonlySet<string>,
+	dependentProcesses: ReadonlyMap<number, string | undefined>,
+): ReapAction[] {
+	return [...actions].sort((left, right) => {
+		const dependentOrder =
+			Number(isProtectedDaemonAction(left.daemon, dependentSockets, dependentProcesses)) -
+			Number(isProtectedDaemonAction(right.daemon, dependentSockets, dependentProcesses));
+		return dependentOrder || SHUTDOWN_ALL_ACTION_ORDER[left.kind] - SHUTDOWN_ALL_ACTION_ORDER[right.kind];
+	});
+}
+
 const SHUTDOWN_ALL_ACTION_ORDER: Record<ReapAction["kind"], number> = {
 	shutdown: 0,
 	"remove-file": 1,
@@ -565,19 +589,23 @@ async function runShutdownAllConverging(
 	const stopped: Array<{ socketPath: string; action: string }> = [];
 	const failed: Array<{ socketPath: string; reason: string }> = [];
 	const handledPids = new Set<number>();
+	const protectedSockets = new Set<string>();
+	const protectedProcesses = new Map<number, string | undefined>();
 	const reportedFailures = new Set<string>();
 
-	if (force) {
-		await stopHiddenSupervisors(stopped, failed, handledPids, reportedFailures, assertAdmission);
-	}
 	const daemons = (await discoverDaemons()).filter((daemon) => !isWorkerSocketPath(daemon.socketPath));
 
-	const actions = [...planShutdownAll(daemons, force)].sort(
-		(left, right) => SHUTDOWN_ALL_ACTION_ORDER[left.kind] - SHUTDOWN_ALL_ACTION_ORDER[right.kind],
-	);
+	const dependentSockets = new Set<string>();
+	const dependentProcesses = new Map<number, string | undefined>();
+	collectTrackedDependentScope(dependentSockets, dependentProcesses);
+	const actions = orderShutdownActions(planShutdownAll(daemons, force), dependentSockets, dependentProcesses);
 
 	for (const action of actions) {
 		const { socketPath, pid } = action.daemon;
+		if (isProtectedDaemonAction(action.daemon, protectedSockets, protectedProcesses)) {
+			stopped.push({ socketPath, action: "preserved after shutdown authority rejection" });
+			continue;
+		}
 		if (pid !== undefined && handledPids.has(pid)) {
 			await assertAdmission();
 			removeSocketFile(socketPath);
@@ -592,15 +620,16 @@ async function runShutdownAllConverging(
 			}
 			continue;
 		}
+		let preserveTrackedWorkers = false;
 		switch (action.kind) {
 			case "remove-file": {
 				if ((await probeDaemon(socketPath)).reachable) {
-					apply(
-						await stopBackgroundService(socketPath, pid, handledPids, force, assertAdmission),
-						socketPath,
-						stopped,
-						failed,
-					);
+					const outcome = await stopBackgroundService(socketPath, pid, handledPids, force, assertAdmission);
+					preserveTrackedWorkers = outcome.preserveTrackedWorkers === true;
+					if (preserveTrackedWorkers) {
+						protectAuthorityRejectedScope(socketPath, pid, protectedSockets, protectedProcesses);
+					}
+					apply(outcome, socketPath, stopped, failed);
 				} else {
 					await assertAdmission();
 					if (removeSocketFile(socketPath)) {
@@ -613,12 +642,12 @@ async function runShutdownAllConverging(
 			}
 			case "kill": {
 				if ((await probeDaemon(socketPath)).reachable) {
-					apply(
-						await stopBackgroundService(socketPath, pid, handledPids, force, assertAdmission),
-						socketPath,
-						stopped,
-						failed,
-					);
+					const outcome = await stopBackgroundService(socketPath, pid, handledPids, force, assertAdmission);
+					preserveTrackedWorkers = outcome.preserveTrackedWorkers === true;
+					if (preserveTrackedWorkers) {
+						protectAuthorityRejectedScope(socketPath, pid, protectedSockets, protectedProcesses);
+					}
+					apply(outcome, socketPath, stopped, failed);
 				} else if (isDaemonProcessListening(pid!, socketPath)) {
 					await assertAdmission();
 					await forceKillDaemon(pid!);
@@ -633,19 +662,20 @@ async function runShutdownAllConverging(
 				}
 				break;
 			}
-			case "shutdown":
-				apply(
-					await stopBackgroundService(socketPath, pid, handledPids, force, assertAdmission),
-					socketPath,
-					stopped,
-					failed,
-				);
+			case "shutdown": {
+				const outcome = await stopBackgroundService(socketPath, pid, handledPids, force, assertAdmission);
+				preserveTrackedWorkers = outcome.preserveTrackedWorkers === true;
+				if (preserveTrackedWorkers) {
+					protectAuthorityRejectedScope(socketPath, pid, protectedSockets, protectedProcesses);
+				}
+				apply(outcome, socketPath, stopped, failed);
 				break;
+			}
 			case "skip":
 				failed.push({ socketPath, reason: action.reason });
 				break;
 		}
-		if (force && action.kind !== "skip") {
+		if (force && action.kind !== "skip" && !preserveTrackedWorkers) {
 			failed.push(
 				...(await forceStopTrackedWorkers(socketPath, assertAdmission)).map((reason) => ({ socketPath, reason })),
 			);
@@ -653,7 +683,24 @@ async function runShutdownAllConverging(
 	}
 
 	if (force) {
-		await terminateVerifiedResiduals(stopped, failed, handledPids, reportedFailures, assertAdmission);
+		await stopHiddenSupervisors(
+			stopped,
+			failed,
+			handledPids,
+			protectedSockets,
+			protectedProcesses,
+			reportedFailures,
+			assertAdmission,
+		);
+		await terminateVerifiedResiduals(
+			stopped,
+			failed,
+			handledPids,
+			protectedSockets,
+			protectedProcesses,
+			reportedFailures,
+			assertAdmission,
+		);
 	}
 
 	if (json) {
@@ -682,6 +729,8 @@ async function stopHiddenSupervisors(
 	stopped: Array<{ socketPath: string; action: string }>,
 	failed: Array<{ socketPath: string; reason: string }>,
 	handledPids: Set<number>,
+	protectedSockets: ReadonlySet<string>,
+	protectedProcesses: ReadonlyMap<number, string | undefined>,
 	reportedFailures: Set<string>,
 	assertAdmission: () => Promise<void>,
 ): Promise<void> {
@@ -708,7 +757,13 @@ async function stopHiddenSupervisors(
 				);
 				continue;
 			}
-			hidden.push(...group.filter((listener) => listener.pid !== currentPid));
+			hidden.push(
+				...group.filter(
+					(listener) =>
+						listener.pid !== currentPid &&
+						!isProtectedDaemonAction(listener, protectedSockets, protectedProcesses),
+				),
+			);
 		}
 		if (hidden.length === 0) {
 			return;
@@ -731,10 +786,75 @@ async function stopHiddenSupervisors(
 	}
 }
 
+function addProtectedProcess(
+	protectedProcesses: Map<number, string | undefined>,
+	pid: number,
+	processStartId: string | undefined,
+): void {
+	if (!protectedProcesses.has(pid)) {
+		protectedProcesses.set(pid, processStartId);
+		return;
+	}
+	if (protectedProcesses.get(pid) !== processStartId) {
+		// Conflicting or incomplete identity must broaden protection, never narrow it.
+		protectedProcesses.set(pid, undefined);
+	}
+}
+
+function collectTrackedDependentScope(
+	dependentSockets: Set<string>,
+	dependentProcesses: Map<number, string | undefined>,
+): void {
+	for (const { descriptor } of findAllTrackedWorkers()) {
+		dependentSockets.add(normalizeSocketPath(descriptor.socketPath));
+		addProtectedProcess(dependentProcesses, descriptor.pid, descriptor.processStartId);
+		if (!descriptor.orphanProcessJournalPath) continue;
+		try {
+			for (const orphan of readActiveOrphanProcesses(descriptor.orphanProcessJournalPath, descriptor.pid)) {
+				if (isOrphanProcessIdentityCurrent(orphan)) {
+					addProtectedProcess(dependentProcesses, orphan.pid, orphan.processStartId);
+				}
+			}
+		} catch {
+			// The known worker identity remains deferred; do not infer child identities
+			// from missing or malformed journal data.
+		}
+	}
+}
+
+export function protectAuthorityRejectedScope(
+	supervisorSocketPath: string,
+	supervisorPid: number | undefined,
+	protectedSockets: Set<string>,
+	protectedProcesses: Map<number, string | undefined>,
+): void {
+	protectedSockets.add(normalizeSocketPath(supervisorSocketPath));
+	if (supervisorPid !== undefined) {
+		addProtectedProcess(protectedProcesses, supervisorPid, getProcessStartId(supervisorPid));
+	}
+	for (const { descriptor } of findTrackedWorkers(supervisorSocketPath)) {
+		protectedSockets.add(normalizeSocketPath(descriptor.socketPath));
+		addProtectedProcess(protectedProcesses, descriptor.pid, descriptor.processStartId);
+		if (!descriptor.orphanProcessJournalPath) continue;
+		try {
+			for (const orphan of readActiveOrphanProcesses(descriptor.orphanProcessJournalPath, descriptor.pid)) {
+				if (isOrphanProcessIdentityCurrent(orphan)) {
+					addProtectedProcess(protectedProcesses, orphan.pid, orphan.processStartId);
+				}
+			}
+		} catch {
+			// Missing or malformed child records cannot reduce protection for the
+			// supervisor and worker identities already captured above.
+		}
+	}
+}
+
 async function terminateVerifiedResiduals(
 	stopped: Array<{ socketPath: string; action: string }>,
 	failed: Array<{ socketPath: string; reason: string }>,
 	handledPids: Set<number>,
+	protectedSockets: ReadonlySet<string>,
+	protectedProcesses: ReadonlyMap<number, string | undefined>,
 	reportedFailures: Set<string>,
 	assertAdmission: () => Promise<void>,
 ): Promise<void> {
@@ -768,7 +888,7 @@ async function terminateVerifiedResiduals(
 		previousSignature = signature;
 		const seenPids = new Set<number>();
 		for (const listener of listeners) {
-			if (seenPids.has(listener.pid)) {
+			if (isProtectedDaemonAction(listener, protectedSockets, protectedProcesses) || seenPids.has(listener.pid)) {
 				continue;
 			}
 			seenPids.add(listener.pid);
@@ -897,11 +1017,18 @@ async function stopBackgroundService(
 	assertAdmission: () => Promise<void>,
 ): Promise<ReapOutcome> {
 	await assertAdmission();
-	if (await shutdownDaemon(socketPath, force)) {
+	const shutdownAttempt = await shutdownDaemon(socketPath, force);
+	if (shutdownAttempt.status === "stopped") {
 		if (pid !== undefined) {
 			handledPids.add(pid);
 		}
 		return { reaped: `stopped background service${pid ? ` (pid ${pid})` : ""}` };
+	}
+	if (shutdownAttempt.status === "authority-rejected") {
+		return {
+			skipped: "shutdown authority rejected; refusing signal fallback",
+			preserveTrackedWorkers: true,
+		};
 	}
 	if (!(await canConnectToSocket(socketPath, 250))) {
 		await assertAdmission();
@@ -1136,7 +1263,17 @@ export async function runReap(json: boolean, force: boolean): Promise<void> {
 	}
 }
 
-type ReapOutcome = { reaped: string } | { skipped: string };
+type ReapOutcome = ({ reaped: string } | { skipped: string }) & { preserveTrackedWorkers?: boolean };
+
+export function reapOutcomeFromShutdownAttempt(attempt: DaemonShutdownAttempt, pid: number | undefined): ReapOutcome {
+	if (attempt.status === "stopped") {
+		return { reaped: `stopped idle background service${pid ? ` (pid ${pid})` : ""}` };
+	}
+	if (attempt.status === "authority-rejected") {
+		return { skipped: "shutdown authority rejected", preserveTrackedWorkers: true };
+	}
+	return { skipped: `shutdown request ${attempt.status}` };
+}
 
 function apply(
 	outcome: ReapOutcome,
@@ -1164,9 +1301,7 @@ async function reapReachableDaemon(socketPath: string, pid: number | undefined):
 	if (probe.sessionCount !== 0) {
 		return { skipped: `now has ${probe.sessionCount ?? "unknown"} session(s)` };
 	}
-	return (await shutdownDaemon(socketPath, false))
-		? { reaped: `stopped idle background service${pid ? ` (pid ${pid})` : ""}` }
-		: { skipped: "shutdown request failed" };
+	return reapOutcomeFromShutdownAttempt(await shutdownDaemon(socketPath, false), pid);
 }
 
 function removeSocketFile(socketPath: string): boolean {
@@ -1234,28 +1369,39 @@ async function canConnectToSocket(socketPath: string, timeoutMs: number): Promis
  * shutdown ack alone is not proof, so success is reported only once the socket
  * stops accepting connections.
  */
-async function shutdownDaemon(socketPath: string, force: boolean): Promise<boolean> {
+export type DaemonShutdownAttempt =
+	| { status: "stopped" }
+	| { status: "authority-rejected" }
+	| { status: "unavailable" }
+	| { status: "timed-out" };
+
+export async function shutdownDaemon(socketPath: string, force: boolean): Promise<DaemonShutdownAttempt> {
 	const client = new DaemonClient(socketPath);
 	try {
 		await client.connect(1000);
 	} catch {
 		client.close();
-		return false;
+		return { status: "unavailable" };
 	}
+	let authorityRejected = false;
 	try {
-		await client.request({ type: "shutdown", force }, 1500);
+		const response = await client.requestSupervisorShutdown(force, 1500);
+		authorityRejected = !response.success && response.errorInfo?.code === "shutdown_authority_rejected";
 	} catch {
 		// The daemon may still stop; the connectivity check below is the source of truth.
 	} finally {
 		client.close();
 	}
+	if (authorityRejected) {
+		return { status: "authority-rejected" };
+	}
 
 	const deadline = Date.now() + 5000;
 	while (Date.now() < deadline) {
 		if (!(await canConnectToSocket(socketPath, 250))) {
-			return true;
+			return { status: "stopped" };
 		}
 		await delay(50);
 	}
-	return false;
+	return { status: "timed-out" };
 }
